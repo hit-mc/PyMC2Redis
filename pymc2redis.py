@@ -1,7 +1,7 @@
 # -------------------------------------------------
 # PyMC2Redis: Python Minecraft to Redis script
 # Author: Keuin
-# Version: 1.1 20.07.27
+# Version: 1.2 20.07.27
 # Homepage: https://github.com/keuin/pymc2redis
 # -------------------------------------------------
 
@@ -246,7 +246,7 @@ def on_load(server, old_module):
     if not enabled:
         warn('Due to an earlier error, PyMC2Redis will be disabled. Please check your configuration and reload.')
         return
-    message_thread.run()
+    message_thread.start()
 
 
 def on_unload(server):
