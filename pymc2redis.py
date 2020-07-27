@@ -1,7 +1,7 @@
 # -------------------------------------------------
 # PyMC2Redis: Python Minecraft to Redis script
 # Author: Keuin
-# Version: 1.2 20.07.27
+# Version: 1.21 2020.07.27
 # Homepage: https://github.com/keuin/pymc2redis
 # -------------------------------------------------
 
@@ -15,9 +15,9 @@ import redis
 from redis import Redis
 
 CONFIG_FILE_NAME = 'pymc2redis.json'
-RECEIVE_LOOP_TIMEOUT_SECONDS = 2  # timeout in redis LPOP operation
-RECEIVE_LOOP_SLEEP_SECONDS = 0.5  # time in threading.Event.wait()
-RETRY_SLOWDOWN_INTERVAL_SECONDS = 20
+MESSAGE_THREAD_RECEIVE_TIMEOUT_SECONDS = 2  # timeout in redis LPOP operation
+MESSAGE_THREAD_SLEEP_SECONDS = 0.5  # time in threading.Event.wait()
+RETRY_SLOWDOWN_TARGET_SECONDS = 15
 RETRY_SLOWDOWN_TIMES_THRESHOLD = 10
 
 MSG_PREFIX = [' ', '#']
@@ -56,22 +56,28 @@ def error(text, ingame=False):
 
 
 class MessageThread(Thread):
+    """
+    This thread receives messages from the Redis server, then print them on the in-game chat menu.
+    """
     __quit_event = threading.Event()
 
     def quit(self):
         self.__quit_event.set()
 
     def run(self):
-        info('Starting MessageThread...')
+        info('MessageThread is starting.')
 
         global enabled, con, retry_counter
         while enabled and con:
             try:
                 if retry_counter.value() >= RETRY_SLOWDOWN_TIMES_THRESHOLD:
-                    time.sleep(RETRY_SLOWDOWN_INTERVAL_SECONDS)
-                raw_message = con.brpop(keys=config_keys[CFG_KEY_SENDER], timeout=RECEIVE_LOOP_TIMEOUT_SECONDS)
+                    time.sleep(RETRY_SLOWDOWN_TARGET_SECONDS)  # cool down
+
+                raw_message = con.brpop(
+                    keys=config_keys[CFG_KEY_SENDER],
+                    timeout=MESSAGE_THREAD_RECEIVE_TIMEOUT_SECONDS)
                 if not raw_message:
-                    continue
+                    continue  # Timed out. Possibly not a failure.
                 if len(raw_message) != 2:
                     warn('Received invalid message from Redis server. Ignoring. ({})'.format(raw_message))
                     continue
@@ -81,9 +87,9 @@ class MessageThread(Thread):
             except (ConnectionError, TimeoutError, redis.RedisError) as e:
                 print('An exception occurred while waiting for messages from the Redis server: {}'.format(e))
                 retry_counter.increment()
-            self.__quit_event.wait(RECEIVE_LOOP_SLEEP_SECONDS)
+            self.__quit_event.wait(MESSAGE_THREAD_SLEEP_SECONDS)
 
-        info('Quitting MessageThread...')
+        info('MessageThread is quitting.')
 
 
 class SafeCounter:
@@ -147,7 +153,7 @@ def redis_reconnect():
     try:
         if redis_reconnect_lock.acquire(False):
             if retry_counter.value() >= RETRY_SLOWDOWN_TIMES_THRESHOLD:
-                time.sleep(RETRY_SLOWDOWN_INTERVAL_SECONDS)
+                time.sleep(RETRY_SLOWDOWN_TARGET_SECONDS)  # cool down
             warn('Connection lost. Reconnecting to the Redis server...', True)
             time.sleep(1)
             if redis_connect():
