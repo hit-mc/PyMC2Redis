@@ -40,12 +40,15 @@ CFG_KEY_SENDER = 'sender'
 CFG_KEY_RECEIVER = 'receiver'
 
 
-# Simple STDOUT logger
+# Simple logger wrapper
 def log(text, prefix, ingame):
     message = '[PyMC2Redis][{pf}] {msg}'.format(pf=prefix, msg=text)
     if ingame and svr:
         svr.say('{color}{msg}'.format(msg=message, color=LOG_COLOR))
-    print(message)
+    if svr:
+        svr.logger.info(message)
+    else:
+        print(message)  # fallback to STDOUT
 
 
 def info(text, ingame=False):
@@ -167,7 +170,7 @@ def redis_reconnect():
             warn('Connection lost. Reconnecting to the Redis server...', True)
             time.sleep(1)
             if redis_connect():
-                info('Reconnected. Everything should run smoothly now.')
+                info('Reconnected. Everything should run smoothly now.', True)
             else:
                 info('Failed to reconnect to the specific Redis server.')
             retry_counter.increment()
@@ -202,7 +205,7 @@ def redis_send_message(player: str, msg: str):
                 error('Broken connection. Cannot talk to Redis server.', True)
                 broken_connection = True
     except (ConnectionError, TimeoutError, redis.RedisError) as e:
-        error('Failed to repeat message to the Redis server: {}.'.format(e))
+        error('Failed to talk to the Redis server: {}.'.format(e))
         broken_connection = True
     except Exception as e:
         error('Unexpected exception: {}'.format(e))
@@ -341,7 +344,7 @@ def on_user_info(server, info_):
     if is_valid_message(msg):
         redis_send_message(player, msg)
     elif msg.upper() == COMMAND_STATUS.upper():
-        server.say('Please wait...')
+        server.say('Waiting ping response...')
         server.say((''
                     '==== PyMC2Redis Status ====\n'
                     'Version: {ver}\n'
