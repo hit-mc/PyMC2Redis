@@ -1,7 +1,7 @@
 # -------------------------------------------------
 # PyMC2Redis: Python Minecraft to Redis script
 # Author: Keuin
-# Version: 1.21 2020.07.27
+# Version: 1.22 2020.07.27
 # Homepage: https://github.com/keuin/pymc2redis
 # -------------------------------------------------
 
@@ -15,6 +15,8 @@ import redis
 from redis import Redis
 
 CONFIG_FILE_NAME = 'pymc2redis.json'
+VERSION = '1.22 2020.07.27'
+
 MESSAGE_THREAD_RECEIVE_TIMEOUT_SECONDS = 2  # timeout in redis LPOP operation
 MESSAGE_THREAD_SLEEP_SECONDS = 0.5  # time in threading.Event.wait()
 RETRY_SLOWDOWN_TARGET_SECONDS = 15
@@ -25,6 +27,9 @@ MSG_ENCODING = 'utf-8'
 MSG_COLOR = '§7'
 MSG_USER_COLOR = '§d'
 MSG_SPLIT_STR = '||'
+
+LOG_COLOR = '§e'
+COMMAND_STATUS = '!PYMC'
 
 CFG_REDIS_SERVER = 'redis_server'
 CFG_REDIS_SERVER_ADDRESS = 'address'
@@ -39,7 +44,7 @@ CFG_KEY_RECEIVER = 'receiver'
 def log(text, prefix, ingame):
     message = '[PyMC2Redis][{pf}] {msg}'.format(pf=prefix, msg=text)
     if ingame and svr:
-        svr.say('§e{msg}'.format(msg=message))
+        svr.say('{color}{msg}'.format(msg=message, color=LOG_COLOR))
     print(message)
 
 
@@ -61,13 +66,16 @@ class MessageThread(Thread):
     """
     __quit_event = threading.Event()
 
+    def __init__(self):
+        Thread.__init__(self, name='MessageThread')
+
     def quit(self):
         self.__quit_event.set()
 
     def run(self):
         info('MessageThread is starting.')
 
-        global enabled, con, retry_counter
+        global enabled, con, retry_counter, counter_message_to_game
         while enabled and con:
             try:
                 if retry_counter.value() >= RETRY_SLOWDOWN_TIMES_THRESHOLD:
@@ -83,6 +91,7 @@ class MessageThread(Thread):
                     continue
                 msg = str(raw_message[1], encoding=MSG_ENCODING)
                 print_ingame_message(msg)
+                counter_message_to_game += 1
                 retry_counter.reset()  # If we succeed, reset the cool-down counter
             except (ConnectionError, TimeoutError, redis.RedisError) as e:
                 print('An exception occurred while waiting for messages from the Redis server: {}'.format(e))
@@ -120,6 +129,8 @@ svr = None
 message_thread = None
 redis_reconnect_lock = Lock()
 retry_counter = SafeCounter()
+counter_message_to_game = 0
+counter_message_to_redis = 0
 
 
 def redis_connect() -> bool:
@@ -142,9 +153,8 @@ def redis_connect() -> bool:
                 socket_connect_timeout=10,
                 health_check_interval=15)
             info('Pinging...')
-            if con.ping():
-                return True
-    except redis.RedisError as e:
+            return con.ping()
+    except redis.RedisError:
         return False
 
 
@@ -165,6 +175,47 @@ def redis_reconnect():
         error('Unexpected exception occurred while reconnecting: {}'.format(e))
 
     redis_reconnect_lock.release()
+
+
+def redis_send_message(player: str, msg: str):
+    global con, counter_message_to_redis
+    broken_connection = False
+    try:
+
+        if is_valid_message(msg):
+            if con:
+                msg = clean_message(msg)
+                info('Pushing: {user}->{msg}'.format(user=player, msg=msg))
+                r = con.lpush(config_keys[CFG_KEY_RECEIVER], pack_message(msg, player))
+                try:
+                    if isinstance(r, bytes) or isinstance(r, bytearray):
+                        r = str(r, encoding=MSG_ENCODING)
+                    numeric = int(r)
+                    if numeric > 0:
+                        info('Success.')
+                        counter_message_to_redis += 1
+                    else:
+                        info('Failed when pushing message: queue_length={}, raw_response={}'.format(numeric, r))
+                except ValueError:
+                    error('Invalid response: {}'.format(r))
+            else:
+                error('Broken connection. Cannot talk to Redis server.', True)
+                broken_connection = True
+    except (ConnectionError, TimeoutError, redis.RedisError) as e:
+        error('Failed to repeat message to the Redis server: {}.'.format(e))
+        broken_connection = True
+    except Exception as e:
+        error('Unexpected exception: {}'.format(e))
+
+    if broken_connection:
+        redis_reconnect()
+
+
+def redis_ping() -> bool:
+    try:
+        return con.ping()
+    except redis.RedisError:
+        return False
 
 
 def init() -> bool:
@@ -285,35 +336,20 @@ def on_unload(server):
 
 
 def on_user_info(server, info_):
-    global con
-    broken_connection = False
-    try:
-        msg = str(info_.content)
-        player = str(info_.player)
-
-        if is_valid_message(msg):
-            if con:
-                msg = clean_message(msg)
-                info('Pushing: {user}->{msg}'.format(user=player, msg=msg))
-                r = con.lpush(config_keys[CFG_KEY_RECEIVER], pack_message(msg, player))
-                try:
-                    if isinstance(r, bytes) or isinstance(r, bytearray):
-                        r = str(r, encoding=MSG_ENCODING)
-                    numeric = int(r)
-                    if numeric > 0:
-                        info('Success.')
-                    else:
-                        info('Failed when pushing message: queue_length={}, raw_response={}'.format(numeric, r))
-                except ValueError:
-                    error('Invalid response: {}'.format(r))
-            else:
-                error('Broken connection. Cannot talk to Redis server.', True)
-                broken_connection = True
-    except (ConnectionError, TimeoutError, redis.RedisError) as e:
-        error('Failed to repeat message to the Redis server: {}.'.format(e))
-        broken_connection = True
-    except Exception as e:
-        error('Unexpected exception: {}'.format(e))
-
-    if broken_connection:
-        redis_reconnect()
+    msg = str(info_.content)
+    player = str(info_.player)
+    if is_valid_message(msg):
+        redis_send_message(player, msg)
+    elif msg.upper() == COMMAND_STATUS.upper():
+        server.say('Please wait...')
+        server.say((''
+                    '==== PyMC2Redis Status ====\n'
+                    'Version: {ver}\n'
+                    'Ping: {ping}\n'
+                    'Counter(from-game/to-game): {counter_from}/{counter_to}\n'
+                    '==== PyMC2Redis Status ====').format(
+            ver=VERSION,
+            ping=redis_ping(),
+            counter_from=counter_message_to_redis,
+            counter_to=counter_message_to_game
+        ))
