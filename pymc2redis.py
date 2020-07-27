@@ -79,7 +79,7 @@ class MessageThread(Thread):
                 print_ingame_message(msg)
                 retry_counter = 0  # If we succeed, reset the cool-down counter
             except (ConnectionError, TimeoutError, redis.RedisError) as e:
-                print('An exception occurred when waiting for messages from the Redis server: {}'.format(e))
+                print('An exception occurred while waiting for messages from the Redis server: {}'.format(e))
                 retry_counter += 1
             self.__quit_event.wait(RECEIVE_LOOP_SLEEP_SECONDS)
 
@@ -98,20 +98,30 @@ redis_reconnect_lock = Lock()
 retry_counter = 0
 
 
-def redis_connect():
-    global con
-    if config_server and CFG_REDIS_SERVER_ADDRESS in config_server and CFG_REDIS_SERVER_PORT in config_server:
-        host = config_server[CFG_REDIS_SERVER_ADDRESS]
-        port = config_server[CFG_REDIS_SERVER_PORT]
-        password = config_server[CFG_REDIS_SERVER_PASSWORD] if CFG_REDIS_SERVER_PASSWORD else None
-        con = Redis(
-            host=host,
-            port=port,
-            password=password,
-            socket_timeout=10,
-            socket_connect_timeout=10,
-            health_check_interval=15)
-        info("Connected? I'm not sure.")
+def redis_connect() -> bool:
+    """
+    Connect to the configured Redis server.
+    :return: True if connected, False if failed to connect.
+    """
+    try:
+        global con
+        if config_server and CFG_REDIS_SERVER_ADDRESS in config_server and CFG_REDIS_SERVER_PORT in config_server:
+            host = config_server[CFG_REDIS_SERVER_ADDRESS]
+            port = config_server[CFG_REDIS_SERVER_PORT]
+            password = config_server[CFG_REDIS_SERVER_PASSWORD] if CFG_REDIS_SERVER_PASSWORD else None
+            info('Connecting to Redis server, host={host}:{port}, password=*****.'.format(host=host, port=port))
+            con = Redis(
+                host=host,
+                port=port,
+                password=password,
+                socket_timeout=10,
+                socket_connect_timeout=10,
+                health_check_interval=15)
+            info('Pinging...')
+            if con.ping():
+                return True
+    except redis.RedisError as e:
+        return False
 
 
 def redis_reconnect():
@@ -122,7 +132,10 @@ def redis_reconnect():
                 time.sleep(RETRY_SLOWDOWN_INTERVAL_SECONDS)
             warn('Lost connection. Reconnecting to the Redis server...', True)
             time.sleep(1)
-            redis_connect()
+            if redis_connect():
+                info('Reconnected. Everything should run smoothly now.')
+            else:
+                info('Failed to reconnect to the specific Redis server.')
             retry_counter += 1
     except Exception as e:
         error('Unexpected exception occurred while reconnecting: {}'.format(e))
@@ -178,15 +191,10 @@ def init() -> bool:
     # --- check config ---
 
     # connect to Redis host
-    try:
-        host = config_server[CFG_REDIS_SERVER_ADDRESS]
-        port = config_server[CFG_REDIS_SERVER_PORT]
-        password = config_server[CFG_REDIS_SERVER_PASSWORD] if CFG_REDIS_SERVER_PASSWORD else None
-        info('Connecting to Redis server, host={host}:{port}, password={pwd}.'.format(host=host, port=port,
-                                                                                      pwd=password))
-        redis_connect()
-    except redis.RedisError as e:
-        error('Failed to connect to Redis server:\n{}'.format(e))
+    if redis_connect():
+        info('Connected.')
+    else:
+        error('Failed to connect to Redis server. Please check your settings and network.')
         con = None
         return False
 
@@ -224,8 +232,11 @@ def print_ingame_message(msg: str):
     """
     sp = str(msg).split(MSG_SPLIT_STR)
     if len(sp) == 2:
-        svr.say('{user_color}<{user}>{msg_color}{msg}'.format(msg_color=MSG_COLOR, msg=sp[1], user_color=MSG_USER_COLOR,
-                                                              user=sp[0]))
+        svr.say('{user_color}<{user}> {msg_color}{msg}'.format(
+            msg_color=MSG_COLOR,
+            msg=sp[1],
+            user_color=MSG_USER_COLOR,
+            user=sp[0]))
 
 
 def on_load(server, old_module):
