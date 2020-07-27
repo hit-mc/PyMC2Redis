@@ -1,7 +1,7 @@
 # -------------------------------------------------
 # PyMC2Redis: Python Minecraft to Redis script
 # Author: Keuin
-# Version: 1.0 20.07.27
+# Version: 1.1 20.07.27
 # Homepage: https://github.com/keuin/pymc2redis
 # -------------------------------------------------
 
