@@ -44,15 +44,15 @@ def log(text, prefix, ingame):
 
 
 def info(text, ingame=False):
-    log(text, 'INF', ingame)
+    log(text, 'INFO', ingame)
 
 
 def warn(text, ingame=False):
-    log(text, 'WRN', ingame)
+    log(text, 'WARN', ingame)
 
 
 def error(text, ingame=False):
-    log(text, 'ERR', ingame)
+    log(text, 'ERROR', ingame)
 
 
 class MessageThread(Thread):
@@ -67,23 +67,41 @@ class MessageThread(Thread):
         global enabled, con, retry_counter
         while enabled and con:
             try:
-                if retry_counter >= RETRY_SLOWDOWN_TIMES_THRESHOLD:
+                if retry_counter.value() >= RETRY_SLOWDOWN_TIMES_THRESHOLD:
                     time.sleep(RETRY_SLOWDOWN_INTERVAL_SECONDS)
                 raw_message = con.brpop(keys=config_keys[CFG_KEY_SENDER], timeout=RECEIVE_LOOP_TIMEOUT_SECONDS)
                 if not raw_message:
                     continue
                 if len(raw_message) != 2:
-                    error('Received invalid message from Redis server. Ignoring. ({})'.format(raw_message))
+                    warn('Received invalid message from Redis server. Ignoring. ({})'.format(raw_message))
                     continue
                 msg = str(raw_message[1], encoding=MSG_ENCODING)
                 print_ingame_message(msg)
-                retry_counter = 0  # If we succeed, reset the cool-down counter
+                retry_counter.reset()  # If we succeed, reset the cool-down counter
             except (ConnectionError, TimeoutError, redis.RedisError) as e:
                 print('An exception occurred while waiting for messages from the Redis server: {}'.format(e))
-                retry_counter += 1
+                retry_counter.increment()
             self.__quit_event.wait(RECEIVE_LOOP_SLEEP_SECONDS)
 
         info('Quitting MessageThread...')
+
+
+class SafeCounter:
+    __lock = Lock()
+    __counter = 0
+
+    def increment(self, increment: int = 1):
+        self.__lock.acquire()
+        self.__counter += increment
+        self.__lock.release()
+
+    def reset(self):
+        self.__lock.acquire()
+        self.__counter = 0
+        self.__lock.release()
+
+    def value(self) -> int:
+        return self.__counter
 
 
 # Main program
@@ -95,7 +113,7 @@ config_keys = dict()
 svr = None
 message_thread = None
 redis_reconnect_lock = Lock()
-retry_counter = 0
+retry_counter = SafeCounter()
 
 
 def redis_connect() -> bool:
@@ -128,15 +146,15 @@ def redis_reconnect():
     global retry_counter
     try:
         if redis_reconnect_lock.acquire(False):
-            if retry_counter >= RETRY_SLOWDOWN_TIMES_THRESHOLD:
+            if retry_counter.value() >= RETRY_SLOWDOWN_TIMES_THRESHOLD:
                 time.sleep(RETRY_SLOWDOWN_INTERVAL_SECONDS)
-            warn('Lost connection. Reconnecting to the Redis server...', True)
+            warn('Connection lost. Reconnecting to the Redis server...', True)
             time.sleep(1)
             if redis_connect():
                 info('Reconnected. Everything should run smoothly now.')
             else:
                 info('Failed to reconnect to the specific Redis server.')
-            retry_counter += 1
+            retry_counter.increment()
     except Exception as e:
         error('Unexpected exception occurred while reconnecting: {}'.format(e))
 
@@ -243,10 +261,10 @@ def on_load(server, old_module):
     global enabled, svr, message_thread
     enabled = init()
     svr = server
-    if not enabled:
-        warn('Due to an earlier error, PyMC2Redis will be disabled. Please check your configuration and reload.')
-        return
-    message_thread.start()
+    if enabled:
+        message_thread.start()
+    else:
+        error('Due to an earlier error, PyMC2Redis will be disabled. Please check your configuration and reload.')
 
 
 def on_unload(server):
