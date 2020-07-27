@@ -17,6 +17,9 @@ from redis import Redis
 CONFIG_FILE_NAME = 'pymc2redis.json'
 RECEIVE_LOOP_TIMEOUT_SECONDS = 2  # timeout in redis LPOP operation
 RECEIVE_LOOP_SLEEP_SECONDS = 0.5  # time in threading.Event.wait()
+RETRY_SLOWDOWN_INTERVAL_SECONDS = 20
+RETRY_SLOWDOWN_TIMES_THRESHOLD = 10
+
 MSG_PREFIX = [' ', '#']
 MSG_ENCODING = 'utf-8'
 MSG_COLOR = '§7'
@@ -37,8 +40,7 @@ def log(text, prefix, ingame):
     message = '[PyMC2Redis][{pf}] {msg}'.format(pf=prefix, msg=text)
     if ingame and svr:
         svr.say('§e{msg}'.format(msg=message))
-    else:
-        print(message)
+    print(message)
 
 
 def info(text, ingame=False):
@@ -62,9 +64,11 @@ class MessageThread(Thread):
     def run(self):
         info('Starting MessageThread...')
 
-        global enabled, con
+        global enabled, con, retry_counter
         while enabled and con:
             try:
+                if retry_counter >= RETRY_SLOWDOWN_TIMES_THRESHOLD:
+                    time.sleep(RETRY_SLOWDOWN_INTERVAL_SECONDS)
                 raw_message = con.brpop(keys=config_keys[CFG_KEY_SENDER], timeout=RECEIVE_LOOP_TIMEOUT_SECONDS)
                 if not raw_message:
                     continue
@@ -73,8 +77,10 @@ class MessageThread(Thread):
                     continue
                 msg = str(raw_message[1], encoding=MSG_ENCODING)
                 print_ingame_message(msg)
+                retry_counter = 0  # If we succeed, reset the cool-down counter
             except (ConnectionError, TimeoutError, redis.RedisError) as e:
                 print('An exception occurred when waiting for messages from the Redis server: {}'.format(e))
+                retry_counter += 1
             self.__quit_event.wait(RECEIVE_LOOP_SLEEP_SECONDS)
 
         info('Quitting MessageThread...')
@@ -89,6 +95,7 @@ config_keys = dict()
 svr = None
 message_thread = None
 redis_reconnect_lock = Lock()
+retry_counter = 0
 
 
 def redis_connect():
@@ -104,15 +111,19 @@ def redis_connect():
             socket_timeout=10,
             socket_connect_timeout=10,
             health_check_interval=15)
-        info('Connected.')
+        info("Connected? I'm not sure.")
 
 
 def redis_reconnect():
+    global retry_counter
     try:
         if redis_reconnect_lock.acquire(False):
-            warn('Lost connection. Reconnecting to the Redis server...')
+            if retry_counter >= RETRY_SLOWDOWN_TIMES_THRESHOLD:
+                time.sleep(RETRY_SLOWDOWN_INTERVAL_SECONDS)
+            warn('Lost connection. Reconnecting to the Redis server...', True)
             time.sleep(1)
             redis_connect()
+            retry_counter += 1
     except Exception as e:
         error('Unexpected exception occurred while reconnecting: {}'.format(e))
 
@@ -250,9 +261,18 @@ def on_user_info(server, info_):
                 msg = clean_message(msg)
                 info('Pushing: {user}->{msg}'.format(user=player, msg=msg))
                 r = con.lpush(config_keys[CFG_KEY_RECEIVER], pack_message(msg, player))
-                info('Response: queue_length={}'.format(r))
+                try:
+                    if isinstance(r, bytes) or isinstance(r, bytearray):
+                        r = str(r, encoding=MSG_ENCODING)
+                    numeric = int(r)
+                    if numeric > 0:
+                        info('Success.')
+                    else:
+                        info('Failed when pushing message: queue_length={}, raw_response={}'.format(numeric, r))
+                except ValueError:
+                    error('Invalid response: {}'.format(r))
             else:
-                error('Broken connection. Cannot talk to Redis server.')
+                error('Broken connection. Cannot talk to Redis server.', True)
                 broken_connection = True
     except (ConnectionError, TimeoutError, redis.RedisError) as e:
         error('Failed to repeat message to the Redis server: {}.'.format(e))
