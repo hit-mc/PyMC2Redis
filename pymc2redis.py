@@ -1,11 +1,13 @@
 # -------------------------------------------------
 # PyMC2Redis: Python Minecraft to Redis script
 # Author: Keuin
-# Version: 1.23 2020.07.27
+# Version: 1.3 2020.07.28
 # Homepage: https://github.com/keuin/pymc2redis
 # -------------------------------------------------
 
+import collections
 import json
+import re
 import threading
 import time
 from threading import Lock
@@ -15,10 +17,11 @@ import redis
 from redis import Redis
 
 CONFIG_FILE_NAME = 'pymc2redis.json'
-VERSION = '1.22 2020.07.27'
+VERSION = '1.3 2020.07.28'
 
 MESSAGE_THREAD_RECEIVE_TIMEOUT_SECONDS = 2  # timeout in redis LPOP operation
 MESSAGE_THREAD_SLEEP_SECONDS = 0.5  # time in threading.Event.wait()
+MESSAGE_SEND_MINIMUM_INTERVAL_SECONDS = 0.8
 RETRY_SLOWDOWN_TARGET_SECONDS = 15
 RETRY_SLOWDOWN_TIMES_THRESHOLD = 10
 
@@ -27,6 +30,11 @@ MSG_ENCODING = 'utf-8'
 MSG_COLOR = '§7'
 MSG_USER_COLOR = '§d'
 MSG_SPLIT_STR = '||'
+
+COLOR_GREEN = '§a'
+COLOR_BLUE = '§9'
+COLOR_YELLOW = '§e'
+COLOR_RED = '§c'
 
 LOG_COLOR = '§e'
 COMMAND_STATUS = '!PYMC'
@@ -63,20 +71,34 @@ def error(text, ingame=False):
     log(text, 'ERROR', ingame)
 
 
-class MessageThread(Thread):
+# Simple test dyer
+
+def green(s) -> str:
+    return '{}{}'.format(COLOR_GREEN, s)
+
+
+def yellow(s) -> str:
+    return '{}{}'.format(COLOR_YELLOW, s)
+
+
+def red(s) -> str:
+    return '{}{}'.format(COLOR_RED, s)
+
+
+class MessageReceiverThread(Thread):
     """
     This thread receives messages from the Redis server, then print them on the in-game chat menu.
     """
     __quit_event = threading.Event()
 
     def __init__(self):
-        Thread.__init__(self, name='MessageThread')
+        Thread.__init__(self, name='MessageReceiverThread')
 
     def quit(self):
         self.__quit_event.set()
 
     def run(self):
-        info('MessageThread is starting.')
+        info('MessageReceiverThread is starting.')
 
         global enabled, con, retry_counter, counter_message_to_game
         while enabled and con:
@@ -92,16 +114,169 @@ class MessageThread(Thread):
                 if len(raw_message) != 2:
                     warn('Received invalid message from Redis server. Ignoring. ({})'.format(raw_message))
                     continue
-                msg = str(raw_message[1], encoding=MSG_ENCODING)
-                print_ingame_message(msg)
+                msg = Message.from_redis_raw_bytes(raw_message[1])
+                if not msg:
+                    warn('Cannot parse message: {}'.format(raw_message))
+                    continue
+                msg.print_ingame_message()
                 counter_message_to_game += 1
                 retry_counter.reset()  # If we succeed, reset the cool-down counter
             except (ConnectionError, TimeoutError, redis.RedisError) as e:
                 print('An exception occurred while waiting for messages from the Redis server: {}'.format(e))
                 retry_counter.increment()
-            self.__quit_event.wait(MESSAGE_THREAD_SLEEP_SECONDS)
+            if self.__quit_event.wait(MESSAGE_THREAD_SLEEP_SECONDS):
+                break
 
-        info('MessageThread is quitting.')
+        info('MessageReceiverThread is quitting.')
+
+
+class Message:
+    __sender = ""
+    __body = ""
+
+    def __init__(self, sender: str, body: str):
+        self.__sender = sender
+        self.__body = body
+
+    def get_sender(self):
+        return self.__sender
+
+    def get_body(self):
+        return self.__body
+
+    @staticmethod
+    def from_redis_raw_bytes(raw_bytes: bytes, encoding: str = MSG_ENCODING):
+        """
+        Construct a message from raw bytes received from Redis.
+        :param raw_bytes: the raw bytes.
+        :param encoding: the encoding.
+        :return: the Message object. If failed, return None.
+        """
+        str_ = str(raw_bytes, encoding=encoding)
+        r = re.match(r'([^|]*)(?:\|\|)(.*)', str_)
+        if r and len(r.groups()) == 2:
+            g = r.groups()
+            return Message(g[0], g[1])
+        return None
+
+    @staticmethod
+    def from_ingame_chat(raw_chat_str_with_prefix: str, sender: str):
+        """
+        Build a Message object with in-game chat string and sender ID.
+        :param raw_chat_str_with_prefix: the chat string. such as '#Hello!'
+        :param sender: the sender.
+        :return: A Message. If the parameter is invalid, return None.
+        """
+        if not Message.is_outbound_message(raw_chat_str_with_prefix):
+            return None
+        return Message(sender, Message.__clean_message(raw_chat_str_with_prefix))
+
+    @staticmethod
+    def is_outbound_message(s: str) -> bool:
+        """
+        Check if this string should be transmitted to the Redis server.
+        :param s: The string to be checked. Usually a raw chat string.
+        :return: True or False.
+        """
+        for pf in MSG_PREFIX:
+            if s.startswith(pf):
+                return True
+        return False
+
+    def pack(self) -> str:
+        """
+        Pack the message to a string that can be pushed to Redis server.
+        :return: the string.
+        """
+        return "{sender}{split}{msg}".format(sender=self.__sender, msg=self.__body, split=MSG_SPLIT_STR)
+
+    def print_ingame_message(self):
+        """
+        Print this message on the in-game chat menu, with the default format.
+        """
+        if svr:
+            svr.say(self.__to_ingame_string())
+
+    @staticmethod
+    def __clean_message(message: str) -> str:
+        for pf in MSG_PREFIX:
+            if message.startswith(pf):
+                return message[len(pf):]
+        return message
+
+    def __to_ingame_string(self, msg_color=MSG_COLOR, user_color=MSG_USER_COLOR) -> str:
+        return '{user_color}<{user}> {msg_color}{msg}'.format(
+            msg_color=msg_color,
+            msg=self.__body,
+            user_color=user_color,
+            user=self.__sender)
+
+
+class MessageSenderThread(Thread):
+    """
+    Message sender provides a FIFO queue for message transmitting to the Redis server.
+    Thus the message can be guaranteed to arrive the target server.
+    """
+
+    __queue = collections.deque()
+    __queue_lock = Lock()
+    __quit_event = threading.Event()
+
+    def __init__(self):
+        Thread.__init__(self, name='MessageSenderThread')
+
+    def quit(self):
+        self.__quit_event.set()
+
+    def push(self, msg: Message) -> int:
+        """
+        Add a Message object into the queue.
+        :param msg: the message.
+        :return: the queue length.
+        """
+        self.__queue_lock.acquire(blocking=True)
+        self.__queue.append(msg)
+        size = len(self.__queue)
+        self.__queue_lock.release()
+        return size
+
+    def length(self) -> int:
+        self.__queue_lock.acquire(blocking=True)
+        size = len(self.__queue)
+        self.__queue_lock.release()
+        return size
+
+    def run(self):
+        info('MessageSenderThread is starting.')
+        while enabled and con:
+
+            # ---- loop start ----
+
+            # peek
+            self.__queue_lock.acquire(blocking=True)
+            try:
+                msg = self.__queue[0]
+            except IndexError:
+                msg = None
+            self.__queue_lock.release()
+
+            # send message
+            if isinstance(msg, Message):
+                if redis_send_message(msg):
+                    # success, pop out
+                    self.__queue_lock.acquire(blocking=True)
+                    self.__queue.popleft()
+                    self.__queue_lock.release()
+            elif msg:
+                warn('Bad object in message queue: {}'.format(msg))  # msg is not None and not a Message object
+            # otherwise do nothing
+
+            if self.__quit_event.wait(MESSAGE_SEND_MINIMUM_INTERVAL_SECONDS):
+                break
+
+            # ---- loop end ----
+
+        info('MessageSenderThread is quitting.')
 
 
 class SafeCounter:
@@ -129,11 +304,13 @@ enabled = False
 config_server = dict()
 config_keys = dict()
 svr = None
-message_thread = None
+receiver_thread = None
+sender_thread = None
 redis_reconnect_lock = Lock()
 retry_counter = SafeCounter()
 counter_message_to_game = 0
 counter_message_to_redis = 0
+counter_send_failure = 0
 
 
 def redis_connect() -> bool:
@@ -180,16 +357,21 @@ def redis_reconnect():
     redis_reconnect_lock.release()
 
 
-def redis_send_message(player: str, msg: str):
-    global con, counter_message_to_redis
+def redis_send_message(msg: Message) -> bool:
+    """
+    Send a message to Redis server.
+    :param msg: the Message object.
+    :return: True if success, False if failed.
+    """
+    global con, counter_message_to_redis, counter_send_failure
     broken_connection = False
     try:
+        if con:
+            if msg:
+                # ---- push message start ----
 
-        if is_valid_message(msg):
-            if con:
-                msg = clean_message(msg)
-                info('Pushing: {user}->{msg}'.format(user=player, msg=msg))
-                r = con.lpush(config_keys[CFG_KEY_RECEIVER], pack_message(msg, player))
+                info('Pushing: {user}->{msg}'.format(user=msg.get_sender(), msg=msg.get_body()))
+                r = con.lpush(config_keys[CFG_KEY_RECEIVER], msg.pack())
                 try:
                     if isinstance(r, bytes) or isinstance(r, bytearray):
                         r = str(r, encoding=MSG_ENCODING)
@@ -197,13 +379,20 @@ def redis_send_message(player: str, msg: str):
                     if numeric > 0:
                         info('Success.')
                         counter_message_to_redis += 1
+                        return True
                     else:
                         info('Failed when pushing message: queue_length={}, raw_response={}'.format(numeric, r))
                 except ValueError:
                     error('Invalid response: {}'.format(r))
+
+                # ---- push message end ----
             else:
-                error('Broken connection. Cannot talk to Redis server.', True)
-                broken_connection = True
+                # msg is None
+                error('This should not happen. Please report this to Keuin.')
+        else:
+            error('Broken connection. Cannot talk to Redis server.', True)
+            broken_connection = True
+
     except (ConnectionError, TimeoutError, redis.RedisError) as e:
         error('Failed to talk to the Redis server: {}.'.format(e))
         broken_connection = True
@@ -212,9 +401,13 @@ def redis_send_message(player: str, msg: str):
 
     if broken_connection:
         redis_reconnect()
+    counter_send_failure += 1
+    return False
 
 
 def redis_ping() -> bool:
+    if not con:
+        return False
     try:
         return con.ping()
     except redis.RedisError:
@@ -226,15 +419,19 @@ def init() -> bool:
     Clean-up, load config file and connect to redis server.
     :return: True if success, False if failed to initialize.
     """
-    global con, enabled, config_server, config_keys, message_thread
+    global con, enabled, config_server, config_keys, receiver_thread, sender_thread
 
     # reset connection
     if con:
         con.close()
     con = None
-    if message_thread and message_thread.is_alive():
-        message_thread.quit()
-    message_thread = MessageThread()
+    if isinstance(receiver_thread, MessageReceiverThread) and receiver_thread.is_alive():
+        receiver_thread.quit()
+    receiver_thread = MessageReceiverThread()
+
+    if isinstance(sender_thread, MessageSenderThread) and sender_thread.is_alive():
+        sender_thread.quit()
+    sender_thread = MessageSenderThread()
 
     # read configuration and connect
     try:
@@ -279,61 +476,24 @@ def init() -> bool:
     return True
 
 
-def is_valid_message(s: str) -> bool:
-    """
-    Check if this string should be transmitted to the Redis server.
-    :param s: The string to be checked.
-    :return: True or False.
-    """
-    for pf in MSG_PREFIX:
-        if s.startswith(pf):
-            return True
-    return False
-
-
-def pack_message(message: str, sender: str) -> str:
-    return "{sender}{split}{msg}".format(sender=sender, msg=message, split=MSG_SPLIT_STR)
-
-
-def clean_message(message: str) -> str:
-    for pf in MSG_PREFIX:
-        if message.startswith(pf):
-            return message[len(pf):]
-    return message
-
-
-def print_ingame_message(msg: str):
-    """
-    Receive a message from Redis, format it, and print it on the in-game chat menu.
-    :param msg: the message with format like "trueKeuin||Hello World!".
-    :return: False if the message is invalid.
-    """
-    sp = str(msg).split(MSG_SPLIT_STR)
-    if len(sp) == 2:
-        svr.say('{user_color}<{user}> {msg_color}{msg}'.format(
-            msg_color=MSG_COLOR,
-            msg=sp[1],
-            user_color=MSG_USER_COLOR,
-            user=sp[0]))
-
-
 def on_load(server, old_module):
-    global enabled, svr, message_thread
+    global enabled, svr, receiver_thread
     enabled = init()
     svr = server
     if enabled:
-        message_thread.start()
+        receiver_thread.start()
+        sender_thread.start()
     else:
-        error('Due to an earlier error, PyMC2Redis will be disabled. Please check your configuration and reload.')
+        error('Due to an earlier error, PyMC2Redis will be disabled. Please check your configuration and reload.', True)
 
 
 def on_unload(server):
-    global enabled, con, message_thread
+    global enabled, con, receiver_thread
     if not enabled:
         return
     enabled = False
-    if message_thread:
-        message_thread.quit()
+    if receiver_thread:
+        receiver_thread.quit()
     if con:
         con.close()
 
@@ -341,18 +501,59 @@ def on_unload(server):
 def on_user_info(server, info_):
     msg = str(info_.content)
     player = str(info_.player)
-    if is_valid_message(msg):
-        redis_send_message(player, msg)
+    if Message.is_outbound_message(msg):
+        message = Message.from_ingame_chat(msg, player)
+        if isinstance(sender_thread, MessageSenderThread):
+            sender_thread.push(message)
     elif msg.upper() == COMMAND_STATUS.upper():
-        server.say('Waiting ping response...')
+        server.say('Waiting for ping response...')
+
+        # ping
+        ping = redis_ping()
+        if ping:
+            ping = green('Fine')
+        else:
+            ping = red('Timed Out')
+
+        # check threads
+
+        sender_alive = green('Alive')
+        if not isinstance(sender_thread, MessageSenderThread):
+            sender_alive = red('N/A')
+        elif not sender_thread.is_alive():
+            sender_alive = red('Dead')
+
+        receiver_alive = green('Alive')
+        if not isinstance(receiver_thread, MessageReceiverThread):
+            receiver_alive = red('N/A')
+        elif not sender_thread.is_alive():
+            receiver_alive = red('Dead')
+
+        queue_len = red('N/A')
+        if isinstance(sender_thread, MessageSenderThread):
+            queue_len = sender_thread.length()
+            if queue_len < 0 or queue_len > 4:
+                queue_len = red(queue_len)
+            elif queue_len <= 1:
+                queue_len = green(queue_len)
+            else:
+                queue_len = yellow(queue_len)
+
         server.say((''
                     '==== PyMC2Redis Status ====\n'
                     'Version: {ver}\n'
                     'Ping: {ping}\n'
-                    'Counter(from-game/to-game): {counter_from}/{counter_to}\n'
+                    'Sender Thread: {sender}\n'
+                    'Receiver Thread: {receiver}\n'
+                    'Queue Length: {queue_len}\n'
+                    'Counter (in/out/failed): {counter_in}/{counter_out}/{counter_failed}\n'
                     '==== PyMC2Redis Status ====').format(
             ver=VERSION,
-            ping=redis_ping(),
-            counter_from=counter_message_to_redis,
-            counter_to=counter_message_to_game
+            ping=ping,
+            counter_in=counter_message_to_game,
+            counter_out=counter_message_to_redis,
+            counter_failed=counter_send_failure,
+            queue_len=queue_len,
+            sender=sender_alive,
+            receiver=receiver_alive
         ))
