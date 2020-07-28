@@ -1,7 +1,7 @@
 # -------------------------------------------------
 # PyMC2Redis: Python Minecraft to Redis script
 # Author: Keuin
-# Version: 1.3 2020.07.28
+# Version: 1.31 2020.07.28
 # Homepage: https://github.com/keuin/pymc2redis
 # -------------------------------------------------
 
@@ -17,7 +17,7 @@ import redis
 from redis import Redis
 
 CONFIG_FILE_NAME = 'pymc2redis.json'
-VERSION = '1.3 2020.07.28'
+VERSION = '1.31 2020.07.28'
 
 MESSAGE_THREAD_RECEIVE_TIMEOUT_SECONDS = 2  # timeout in redis LPOP operation
 MESSAGE_THREAD_SLEEP_SECONDS = 0.5  # time in threading.Event.wait()
@@ -35,9 +35,11 @@ COLOR_GREEN = '§a'
 COLOR_BLUE = '§9'
 COLOR_YELLOW = '§e'
 COLOR_RED = '§c'
+COLOR_AQUA = '§b'
 
 LOG_COLOR = '§e'
 COMMAND_STATUS = '!PYMC'
+COMMAND_RESET = '!PYMC reset'
 
 CFG_REDIS_SERVER = 'redis_server'
 CFG_REDIS_SERVER_ADDRESS = 'address'
@@ -85,6 +87,10 @@ def red(s) -> str:
     return '{}{}'.format(COLOR_RED, s)
 
 
+def aqua(s) -> str:
+    return '{}{}'.format(COLOR_AQUA, s)
+
+
 class MessageReceiverThread(Thread):
     """
     This thread receives messages from the Redis server, then print them on the in-game chat menu.
@@ -99,7 +105,7 @@ class MessageReceiverThread(Thread):
 
     def run(self):
         info('MessageReceiverThread is starting.')
-
+        self.__quit_event.clear()
         global enabled, con, retry_counter, counter_message_to_game
         while enabled and con:
             try:
@@ -128,6 +134,7 @@ class MessageReceiverThread(Thread):
                 break
 
         info('MessageReceiverThread is quitting.')
+        info('MRT enabled={e}, con={c}'.format(e=enabled, c=con))
 
 
 class Message:
@@ -248,6 +255,7 @@ class MessageSenderThread(Thread):
 
     def run(self):
         info('MessageSenderThread is starting.')
+        self.__quit_event.clear()
         while enabled and con:
 
             # ---- loop start ----
@@ -277,6 +285,7 @@ class MessageSenderThread(Thread):
             # ---- loop end ----
 
         info('MessageSenderThread is quitting.')
+        info('MST enabled={e}, con={c}'.format(e=enabled, c=con))
 
 
 class SafeCounter:
@@ -416,10 +425,11 @@ def redis_ping() -> bool:
 
 def init() -> bool:
     """
-    Clean-up, load config file and connect to redis server.
+    Clean-up, load config file, connect to Redis server and start message threads.
     :return: True if success, False if failed to initialize.
     """
     global con, enabled, config_server, config_keys, receiver_thread, sender_thread
+    global redis_reconnect_lock, retry_counter, counter_message_to_game, counter_message_to_redis, counter_send_failure
 
     # reset connection
     if con:
@@ -427,11 +437,18 @@ def init() -> bool:
     con = None
     if isinstance(receiver_thread, MessageReceiverThread) and receiver_thread.is_alive():
         receiver_thread.quit()
-    receiver_thread = MessageReceiverThread()
 
     if isinstance(sender_thread, MessageSenderThread) and sender_thread.is_alive():
         sender_thread.quit()
-    sender_thread = MessageSenderThread()
+
+    # reset globals
+    receiver_thread = None
+    sender_thread = None
+    redis_reconnect_lock = Lock()
+    retry_counter = SafeCounter()
+    counter_message_to_game = 0
+    counter_message_to_redis = 0
+    counter_send_failure = 0
 
     # read configuration and connect
     try:
@@ -439,6 +456,9 @@ def init() -> bool:
             config = json.load(f)
     except FileNotFoundError:
         error('Cannot locate configuration file {}.'.format(CONFIG_FILE_NAME))
+        return False
+    except IOError as e:
+        error('Encountered an I/O exception while reading configuration file {f}: {e}'.format(f=CONFIG_FILE_NAME, e=e))
         return False
 
     # --- check config ---
@@ -469,22 +489,58 @@ def init() -> bool:
     if redis_connect():
         info('Connected.')
     else:
-        error('Failed to connect to Redis server. Please check your settings and network.')
+        error('Failed to connect to Redis server. Please check your settings and network.', True)
         con = None
         return False
+
+    # start threads
+    enabled = True
+    receiver_thread = MessageReceiverThread()
+    sender_thread = MessageSenderThread()
+    receiver_thread.start()
+    sender_thread.start()
 
     return True
 
 
+def enable():
+    """
+    Initialize the plugin, and print error messages if failed to enable it.
+    :return:
+    """
+    global enabled
+    enabled = init()
+    if not enabled:
+        error('Due to an earlier error, PyMC2Redis will be disabled.'
+              ' Please check your configuration and type "{cmd}" to reset.'.format(cmd=COMMAND_RESET), True)
+
+
+def disable():
+    global enabled, redis_reconnect_lock
+
+    enabled = False
+
+    if isinstance(sender_thread, MessageSenderThread) and sender_thread.is_alive():
+        info('Stopping sender thread.')
+        sender_thread.quit()
+        sender_thread.join()
+
+    if isinstance(receiver_thread, MessageReceiverThread) and receiver_thread.is_alive():
+        info('Stopping receiver thread.')
+        receiver_thread.quit()
+        receiver_thread.join()
+
+    if isinstance(con, Redis):
+        info('Closing connection.')
+        con.close()
+
+    redis_reconnect_lock = Lock()  # Generate a new lock to prevent unexpected deadlock.
+
+
 def on_load(server, old_module):
     global enabled, svr, receiver_thread
-    enabled = init()
     svr = server
-    if enabled:
-        receiver_thread.start()
-        sender_thread.start()
-    else:
-        error('Due to an earlier error, PyMC2Redis will be disabled. Please check your configuration and reload.', True)
+    enable()
 
 
 def on_unload(server):
@@ -502,10 +558,22 @@ def on_user_info(server, info_):
     msg = str(info_.content)
     player = str(info_.player)
     if Message.is_outbound_message(msg):
+        # Message
         message = Message.from_ingame_chat(msg, player)
         if isinstance(sender_thread, MessageSenderThread):
             sender_thread.push(message)
+    elif msg.upper() == COMMAND_RESET.upper():
+        # !PYMC reset
+        info(aqua('Disabling...'), True)
+        disable()
+        info(aqua('Enabling...'), True)
+        r = init()
+        if r:
+            info(aqua('Reloaded. Type "{cmd}" to check working status.'.format(cmd=COMMAND_STATUS)), True)
+        else:
+            info(red('Failed to reload. Report this to Keuin.'), True)
     elif msg.upper() == COMMAND_STATUS.upper():
+        # !PYMC
         server.say('Waiting for ping response...')
 
         # ping
