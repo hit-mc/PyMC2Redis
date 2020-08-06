@@ -1,7 +1,7 @@
 # -------------------------------------------------
 # PyMC2Redis: Python Minecraft to Redis script
 # Author: Keuin
-# Version: 1.31 2020.07.28
+# Version: 1.32 2020.07.28
 # Homepage: https://github.com/keuin/pymc2redis
 # -------------------------------------------------
 
@@ -24,6 +24,8 @@ MESSAGE_THREAD_SLEEP_SECONDS = 0.5  # time in threading.Event.wait()
 MESSAGE_SEND_MINIMUM_INTERVAL_SECONDS = 0.8
 RETRY_SLOWDOWN_TARGET_SECONDS = 15
 RETRY_SLOWDOWN_TIMES_THRESHOLD = 10
+ALTERNATIVE_RETRY_SLOWDOWN_TIMES_THRESHOLD = 5
+ALTERNATIVE_RETRY_SLOWDOWN_TARGET_SECONDS = 60
 
 MSG_PREFIX = [' ', '#']
 MSG_ENCODING = 'utf-8'
@@ -353,8 +355,12 @@ def redis_reconnect():
         if redis_reconnect_lock.acquire(False):
             if retry_counter.value() >= RETRY_SLOWDOWN_TIMES_THRESHOLD:
                 time.sleep(RETRY_SLOWDOWN_TARGET_SECONDS)  # cool down
-            warn('Connection lost. Reconnecting to the Redis server...', True)
-            time.sleep(1)
+            elif retry_counter.value() >= ALTERNATIVE_RETRY_SLOWDOWN_TIMES_THRESHOLD:
+                time.sleep(ALTERNATIVE_RETRY_SLOWDOWN_TARGET_SECONDS)
+            else:
+                time.sleep(1)
+            warn('Connection lost. Reconnecting to the Redis server... (retry_counter={cnt})'.format(
+                cnt=retry_counter.value()), True)
             if redis_connect():
                 info('Reconnected. Everything should run smoothly now.', True)
             else:
