@@ -95,6 +95,9 @@ def aqua(s) -> str:
 
 
 class RCommand:
+    """
+    Base Redis command class.
+    """
     _reply = None
 
     @staticmethod
@@ -140,6 +143,11 @@ class RCommand:
 
 
 class RCList(RCommand):
+    """
+    Redis command that shows all online players.
+    default command: #!list
+    """
+
     def is_valid_echo(self, message: str) -> bool:
         if re.match(r'There are [0-9]+ of a max [0-9]+ players online:', message):
             self._reply = message
@@ -191,7 +199,7 @@ class MessageReceiverThread(Thread):
                     continue
                 rcmd_instance = RCommand.from_redis_message(msg.get_body())
                 if rcmd_instance:
-                    # The message is a Redis command
+                    # If the message is a valid Redis command
                     if not rcommand:
                         rcommand = rcmd_instance
                         rcmd_instance.execute(svr)
@@ -200,7 +208,11 @@ class MessageReceiverThread(Thread):
                             'There is already a Redis command waiting for server response. The new command {} will be ignored.'.format(
                                 msg.get_body()))
                 else:
+                    # The message is a normal chat msg. Just repeat it.
                     msg.print_ingame_message()
+
+                # finish processing Redis message
+                # update counters
                 counter_message_to_game += 1  # The counter cares about all messages.
                 retry_counter.reset()  # If we succeed, reset the cool-down counter
             except (ConnectionError, TimeoutError, redis.RedisError) as e:
