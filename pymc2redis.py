@@ -136,12 +136,9 @@ def translate(lang_from: dict, lang_to: dict, text: str):
 
     for k, v in lang_from.items():
         # traverse all items and try to fit.
-        if k == 'death.attack.player.item':
-            log('!!!!! {}'.format(v))
         r = re.fullmatch(v, text)
         if r:
             # The message fits this item!
-            log('matched!! {}'.format(v))
             universe_key = k  # We use the key to identify this string
             params = r.groups()
             break
