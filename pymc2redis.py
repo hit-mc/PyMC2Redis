@@ -1,7 +1,7 @@
 # -------------------------------------------------
 # PyMC2Redis: Python Minecraft to Redis script
 # Author: Keuin
-# Version: 1.33 2020.08.10
+# Version: 1.34 2020.08.10
 # Homepage: https://github.com/keuin/pymc2redis
 # -------------------------------------------------
 
@@ -51,10 +51,14 @@ CFG_REDIS_SERVER_PASSWORD = 'password'
 CFG_KEY = 'key'
 CFG_KEY_SENDER = 'sender'
 CFG_KEY_RECEIVER = 'receiver'
+CFG_LANGUAGE = 'lang'
+CFG_TRANSLATION_SETTING = 'translating'
+CFG_TRANSLATION_FROM = 'from'
+CFG_TRANSLATION_TO = 'to'
 
 
 # Simple logger wrapper
-def log(text, prefix, ingame):
+def log(text, prefix='LOG', ingame=False):
     message = '[PyMC2Redis][{pf}] {msg}'.format(pf=prefix, msg=text)
     if ingame and svr:
         svr.say('{color}{msg}'.format(msg=message, color=LOG_COLOR))
@@ -93,6 +97,76 @@ def red(s) -> str:
 def aqua(s) -> str:
     return '{}{}'.format(COLOR_AQUA, s)
 
+
+# in-game message translator
+
+def translate_format_item_value(a: str):
+    """
+    Preprocess: we replace all marks like %1$s to regex capture group (\S+)
+    param a: The string to be processed.
+    :return: The processed string.
+    """
+    i = 1
+    pattern = '%{i}$s'
+    desired = r'(\[.+\]|\S+)'
+    while pattern.format(i=i) in a:
+        a = a.replace(pattern.format(i=i), desired)
+        i += 1
+    return a
+
+
+def translate(lang_from: dict, lang_to: dict, text: str):
+    """
+    Trnaslate a in-game message to a specific language.
+    :param lang_from: the origin language.
+    :param lang_to: the desired language.
+    :param text: the message text to be translated.
+    :return: a str object if translated, or None if failed.
+    """
+
+    # preprocess: we replace all marks like %1$s to regex capture group (\S+)
+
+    for k, v in lang_from.items():
+        lang_from[k] = translate_format_item_value(v)
+
+    # start translating
+
+    universe_key = None
+    params = None
+
+    for k, v in lang_from.items():
+        # traverse all items and try to fit.
+        if k == 'death.attack.player.item':
+            log('!!!!! {}'.format(v))
+        r = re.fullmatch(v, text)
+        if r:
+            # The message fits this item!
+            log('matched!! {}'.format(v))
+            universe_key = k  # We use the key to identify this string
+            params = r.groups()
+            break
+
+    # Now we have universe_key and params. We need to translate them into the target language.
+
+    if not universe_key:
+        # Oh no, we haven't found the universe key. Maybe the language setting is wrong?
+        warn('Translator failed to match any items in the source language dict.')
+        return None
+
+    if universe_key not in lang_to:
+        # The target language doesn't contain the key we need. Failed.
+        warn('Translator failed to find desired item in the target language.')
+        return None
+
+    s = str(lang_to[universe_key])
+    for i, real in enumerate(params):
+        pattern = '%{i}$s'.format(i=i + 1)
+        s = s.replace(pattern, real)
+
+    return s
+
+
+# Redis command related
 
 class RCommand:
     """
@@ -163,6 +237,8 @@ class RCList(RCommand):
     def execute(self, server):
         server.execute('list')
 
+
+# Message management related (ADT/threads)
 
 class MessageReceiverThread(Thread):
     """
@@ -267,8 +343,8 @@ class Message:
         return Message(sender, Message.__clean_message(raw_chat_str_with_prefix))
 
     @staticmethod
-    def from_server_console_echo(echo: str):
-        return Message('SERVER', echo)
+    def from_server_console_echo(echo: str, title='SERVER'):
+        return Message(title, echo)
 
     @staticmethod
     def is_outbound_message(s: str) -> bool:
@@ -404,6 +480,8 @@ con = None
 enabled = False
 config_server = dict()
 config_keys = dict()
+language = {}
+translating = {"from": "", "to": ""}
 svr = None
 receiver_thread = None
 sender_thread = None
@@ -535,7 +613,7 @@ def init() -> bool:
     Clean-up, load config file, connect to Redis server and start message threads.
     :return: True if success, False if failed to initialize.
     """
-    global con, enabled, config_server, config_keys, receiver_thread, sender_thread
+    global con, enabled, config_server, config_keys, language, translating, receiver_thread, sender_thread
     global redis_reconnect_lock, retry_counter, counter_message_to_game, counter_message_to_redis, counter_send_failure, rcommand
 
     # reset connection
@@ -560,7 +638,7 @@ def init() -> bool:
 
     # read configuration and connect
     try:
-        with open(CONFIG_FILE_NAME, 'r') as f:
+        with open(CONFIG_FILE_NAME, 'r', encoding='utf-8') as f:
             config = json.load(f)
     except FileNotFoundError:
         error('Cannot locate configuration file {}.'.format(CONFIG_FILE_NAME))
@@ -589,6 +667,29 @@ def init() -> bool:
     if CFG_KEY_SENDER not in config_keys \
             or CFG_KEY_RECEIVER not in config_keys:
         error('Cannot read keys.sender or keys.receiver from the configuration.')
+        return False
+
+    # check and read the translation and languages
+
+    language = config[CFG_LANGUAGE]
+    translating = config[CFG_TRANSLATION_SETTING]
+
+    if not isinstance(language, dict):
+        error('Malformed language dict in the configuration.')
+        return False
+
+    if not isinstance(translating, dict) or 'from' not in translating or 'to' not in translating:
+        error('Invalid translating setting in the configuration.')
+        return False
+
+    # Validate needed languages
+
+    if translating['from'] not in language:
+        error('The language {} of translating.from is not defined.'.format(translating['from']))
+        return False
+
+    if translating['to'] not in language:
+        error('The language {} of translating.to is not defined.'.format(translating['to']))
         return False
 
     # --- check config ---
@@ -665,6 +766,8 @@ def on_unload(server):
 def on_info(server, info_):
     global rcommand
     if info_.is_user or not isinstance(rcommand, RCommand):
+        # We just care about Redis command echo in this procedure.
+        # For user messages, we process them in on_user_info().
         return
     msg = str(info_.content)
     if rcommand.is_valid_echo(msg):
@@ -683,10 +786,14 @@ def on_user_info(server, info_):
     msg = str(info_.content)
     player = str(info_.player)
     if Message.is_outbound_message(msg):
+        # If the message sent by a player is a valid outbound message (to Redis).
         # Message
         message = Message.from_ingame_chat(msg, player)
         if isinstance(sender_thread, MessageSenderThread):
+            # If the message sender thread is alive.
             sender_thread.push(message)
+        else:
+            error('Message sender thread is not alive. Cannot repeat outbound message.')
     elif msg.upper() == COMMAND_RESET.upper():
         # !PYMC reset
         info(aqua('Disabling...'), True)
@@ -750,3 +857,43 @@ def on_user_info(server, info_):
             sender=sender_alive,
             receiver=receiver_alive
         ))
+
+
+# def on_player_joined(server, player):
+#     if not enabled:
+#         return
+#     msg = Message.from_server_console_echo('{} joined the game.'.format(player), '登录')
+#     if isinstance(sender_thread, MessageSenderThread):
+#         # If the message sender thread is alive.
+#         sender_thread.push(msg)
+#
+#
+# def on_player_left(server, player):
+#     if not enabled:
+#         return
+#     msg = Message.from_server_console_echo('{} left the game.'.format(player), '离开')
+#     if isinstance(sender_thread, MessageSenderThread):
+#         # If the message sender thread is alive.
+#         sender_thread.push(msg)
+
+
+def on_death_message(server, death_message):
+    if not enabled:
+        return
+    translated_death_message = translate(language[translating[CFG_TRANSLATION_FROM]],
+                                         language[translating[CFG_TRANSLATION_TO]], death_message)
+    log('translation: {} -> {}'.format(death_message, translated_death_message))
+    msg = Message.from_server_console_echo(translated_death_message, '悲報')
+    if isinstance(sender_thread, MessageSenderThread):
+        # If the message sender thread is alive.
+        sender_thread.push(msg)
+
+
+def on_player_made_advancement(server, player, advancement):
+    if not enabled:
+        return
+    msg = Message.from_server_console_echo(
+        '{player_id} 达成成就 {advancement}'.format(player_id=player, advancement=advancement), '喜訊')
+    if isinstance(sender_thread, MessageSenderThread):
+        # If the message sender thread is alive.
+        sender_thread.push(msg)
