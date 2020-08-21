@@ -1,7 +1,7 @@
 # -------------------------------------------------
 # PyMC2Redis: Python Minecraft to Redis script
 # Author: Keuin
-# Version: 1.32 2020.07.28
+# Version: 1.33 2020.08.10
 # Homepage: https://github.com/keuin/pymc2redis
 # -------------------------------------------------
 
@@ -17,7 +17,7 @@ import redis
 from redis import Redis
 
 CONFIG_FILE_NAME = 'pymc2redis.json'
-VERSION = '1.31 2020.07.28'
+VERSION = '1.33 2020.08.10'
 
 MESSAGE_THREAD_RECEIVE_TIMEOUT_SECONDS = 2  # timeout in redis LPOP operation
 MESSAGE_THREAD_SLEEP_SECONDS = 0.5  # time in threading.Event.wait()
@@ -42,6 +42,7 @@ COLOR_AQUA = '§b'
 LOG_COLOR = '§e'
 COMMAND_STATUS = '!PYMC'
 COMMAND_RESET = '!PYMC reset'
+RCOMMAND_LIST = '!LIST'  # Redis command
 
 CFG_REDIS_SERVER = 'redis_server'
 CFG_REDIS_SERVER_ADDRESS = 'address'
@@ -93,6 +94,68 @@ def aqua(s) -> str:
     return '{}{}'.format(COLOR_AQUA, s)
 
 
+class RCommand:
+    _reply = None
+
+    @staticmethod
+    def from_redis_message(msg: str):
+        """
+        Build a RCommand object from a Redis message.
+        :param msg: a message from the Redis server.
+        :return: If the message is a valid Redis command, return a RCommand instance. Otherwise return None.
+        """
+        if RCOMMAND_LIST.lower() == str(msg).lower():
+            return RCList()
+        return None
+
+    def get_echo(self):
+        """
+        Get the formatted echo. Note: is_valid_echo should be called and return True in advance.
+        :return: The echo. If failed, return None.
+        """
+        if self._reply:
+            return self._format_reply(self._reply)
+        return None
+
+    def is_valid_echo(self, message: str) -> bool:
+        """
+        After receiving a message from the server console, this method check if the message is a reply to this command instance.
+        :return: True if the message is a reply to this command, thus this command instance should be executed and pop out. Otherwise, return False.
+        """
+        # This is a numb impl.
+        # DO NOT RELY ON THIS
+        self._reply = message
+        return False
+
+    def execute(self, server):
+        pass
+
+    def _format_reply(self, reply: str) -> str:
+        """
+        Format a valid reply from the server console to a friendly form.
+        :param reply: The raw reply from server console.
+        :return: The formatted message, which should be sent to the Redis as a response.
+        """
+        return reply
+
+
+class RCList(RCommand):
+    def is_valid_echo(self, message: str) -> bool:
+        if re.match(r'There are [0-9]+ of a max [0-9]+ players online:', message):
+            self._reply = message
+            return True
+        return False
+
+    def _format_reply(self, reply: str) -> str:
+        r = re.findall(r'There are [0-9]+ of a max [0-9]+ players online:.*', reply)
+        if not r:
+            return 'Error: blank reply message.'
+        return r[0]
+
+    def execute(self, server):
+        server.execute('list')
+
+
 class MessageReceiverThread(Thread):
     """
     This thread receives messages from the Redis server, then print them on the in-game chat menu.
@@ -108,7 +171,7 @@ class MessageReceiverThread(Thread):
     def run(self):
         info('MessageReceiverThread is starting.')
         self.__quit_event.clear()
-        global enabled, con, retry_counter, counter_message_to_game
+        global enabled, con, retry_counter, counter_message_to_game, rcommand, svr
         while enabled and con:
             try:
                 if retry_counter.value() >= RETRY_SLOWDOWN_TIMES_THRESHOLD:
@@ -126,11 +189,22 @@ class MessageReceiverThread(Thread):
                 if not msg:
                     warn('Cannot parse message: {}'.format(raw_message))
                     continue
-                msg.print_ingame_message()
-                counter_message_to_game += 1
+                rcmd_instance = RCommand.from_redis_message(msg.get_body())
+                if rcmd_instance:
+                    # The message is a Redis command
+                    if not rcommand:
+                        rcommand = rcmd_instance
+                        rcmd_instance.execute(svr)
+                    else:
+                        warn(
+                            'There is already a Redis command waiting for server response. The new command {} will be ignored.'.format(
+                                msg.get_body()))
+                else:
+                    msg.print_ingame_message()
+                counter_message_to_game += 1  # The counter cares about all messages.
                 retry_counter.reset()  # If we succeed, reset the cool-down counter
             except (ConnectionError, TimeoutError, redis.RedisError) as e:
-                print('An exception occurred while waiting for messages from the Redis server: {}'.format(e))
+                error('An exception occurred while waiting for messages from the Redis server: {}'.format(e))
                 retry_counter.increment()
             if self.__quit_event.wait(MESSAGE_THREAD_SLEEP_SECONDS):
                 break
@@ -179,6 +253,10 @@ class Message:
         if not Message.is_outbound_message(raw_chat_str_with_prefix):
             return None
         return Message(sender, Message.__clean_message(raw_chat_str_with_prefix))
+
+    @staticmethod
+    def from_server_console_echo(echo: str):
+        return Message('SERVER', echo)
 
     @staticmethod
     def is_outbound_message(s: str) -> bool:
@@ -322,6 +400,7 @@ retry_counter = SafeCounter()
 counter_message_to_game = 0
 counter_message_to_redis = 0
 counter_send_failure = 0
+rcommand = None  # A RCommand waiting for response.
 
 
 def redis_connect() -> bool:
@@ -429,13 +508,23 @@ def redis_ping() -> bool:
         return False
 
 
+# def parse_redis_command(message):
+#     """
+#     Check if a message from Redis is a command. If so, execute it. Otherwise do nothing.
+#     :return: A string if the given message is a valid Redis command, and it has been executed. False if the message is not a Redis command.
+#     """
+#     message = str(message).lower()
+#     if message == RCOMMAND_LIST.lower():
+#         # list players
+
+
 def init() -> bool:
     """
     Clean-up, load config file, connect to Redis server and start message threads.
     :return: True if success, False if failed to initialize.
     """
     global con, enabled, config_server, config_keys, receiver_thread, sender_thread
-    global redis_reconnect_lock, retry_counter, counter_message_to_game, counter_message_to_redis, counter_send_failure
+    global redis_reconnect_lock, retry_counter, counter_message_to_game, counter_message_to_redis, counter_send_failure, rcommand
 
     # reset connection
     if con:
@@ -455,6 +544,7 @@ def init() -> bool:
     counter_message_to_game = 0
     counter_message_to_redis = 0
     counter_send_failure = 0
+    rcommand = None
 
     # read configuration and connect
     try:
@@ -558,6 +648,23 @@ def on_unload(server):
         receiver_thread.quit()
     if con:
         con.close()
+
+
+def on_info(server, info_):
+    global rcommand
+    if info_.is_user or not isinstance(rcommand, RCommand):
+        return
+    msg = str(info_.content)
+    if rcommand.is_valid_echo(msg):
+        if isinstance(sender_thread, MessageSenderThread):
+            echo = rcommand.get_echo()
+            if echo:
+                sender_thread.push(Message.from_server_console_echo(echo))
+            else:
+                error('Invalid echo from the server console.')
+            rcommand = None  # Remove the command
+        else:
+            error('Sender thread is not alive, the pending Redis command cannot be executed.')
 
 
 def on_user_info(server, info_):
