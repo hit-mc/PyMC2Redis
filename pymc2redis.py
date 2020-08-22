@@ -1,7 +1,7 @@
 # -------------------------------------------------
 # PyMC2Redis: Python Minecraft to Redis script
 # Author: Keuin
-# Version: 1.34 2020.08.21
+# Version: 1.35 2020.08.22
 # Homepage: https://github.com/keuin/pymc2redis
 # -------------------------------------------------
 
@@ -17,7 +17,7 @@ import redis
 from redis import Redis
 
 CONFIG_FILE_NAME = 'pymc2redis.json'
-VERSION = '1.34 2020.08.21'
+VERSION = '1.35 2020.08.22'
 
 MESSAGE_THREAD_RECEIVE_TIMEOUT_SECONDS = 2  # timeout in redis LPOP operation
 MESSAGE_THREAD_SLEEP_SECONDS = 0.5  # time in threading.Event.wait()
@@ -880,7 +880,10 @@ def on_death_message(server, death_message):
     translated_death_message = translate(language[translating[CFG_TRANSLATION_FROM]],
                                          language[translating[CFG_TRANSLATION_TO]], death_message)
     log('translation: {} -> {}'.format(death_message, translated_death_message))
-    msg = Message.from_server_console_echo(translated_death_message, '悲報')
+    msg = Message.from_server_console_echo(translated_death_message if translated_death_message else death_message,
+                                           '悲報')
+    if not translated_death_message:
+        warn('Failed to translate the death message. Use origin message instead.')
     if isinstance(sender_thread, MessageSenderThread):
         # If the message sender thread is alive.
         sender_thread.push(msg)
@@ -889,8 +892,15 @@ def on_death_message(server, death_message):
 def on_player_made_advancement(server, player, advancement):
     if not enabled:
         return
+    translated_advancement = translate(language[translating[CFG_TRANSLATION_FROM]],
+                                       language[translating[CFG_TRANSLATION_TO]], advancement)
+    log('translation: {} -> {}'.format(advancement, translated_advancement))
+    if not translated_advancement:
+        warn('Failed to translate the advancement name. Use origin name instead.')
     msg = Message.from_server_console_echo(
-        '{player_id} 达成成就 {advancement}'.format(player_id=player, advancement=advancement), '喜訊')
+        '{player_id} 达成成就 {advancement}'.format(player_id=player,
+                                                advancement=translated_advancement if translated_advancement else advancement),
+        '喜訊')
     if isinstance(sender_thread, MessageSenderThread):
         # If the message sender thread is alive.
         sender_thread.push(msg)
