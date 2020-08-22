@@ -84,7 +84,7 @@ def error(text, ingame=False):
     log(text, 'ERROR', ingame)
 
 
-# Simple test dyer
+# Simple text dyer
 
 def green(s) -> str:
     return '{}{}'.format(COLOR_GREEN, s)
