@@ -33,6 +33,10 @@ MSG_COLOR = '§7'
 MSG_USER_COLOR = '§d'
 MSG_SPLIT_STR = '||'
 
+HEAD_PLAYER_LIST = 'SERVER'
+HEAD_PLAYER_DIE = '悲報'
+HEAD_PLAYER_ADVANCEMENT = '喜訊'
+
 COLOR_GREEN = '§a'
 COLOR_BLUE = '§9'
 COLOR_YELLOW = '§e'
@@ -771,7 +775,7 @@ def on_info(server, info_):
         if isinstance(sender_thread, MessageSenderThread):
             echo = rcommand.get_echo()
             if echo:
-                sender_thread.push(Message.from_server_console_echo(echo))
+                sender_thread.push(Message.from_server_console_echo(echo, HEAD_PLAYER_LIST))
             else:
                 error('Invalid echo from the server console.')
             rcommand = None  # Remove the command
@@ -881,7 +885,7 @@ def on_death_message(server, death_message):
                                          language[translating[CFG_TRANSLATION_TO]], death_message)
     log('translation: {} -> {}'.format(death_message, translated_death_message))
     msg = Message.from_server_console_echo(translated_death_message if translated_death_message else death_message,
-                                           '悲報')
+                                           HEAD_PLAYER_DIE)
     if not translated_death_message:
         warn('Failed to translate the death message. Use origin message instead.')
     if isinstance(sender_thread, MessageSenderThread):
@@ -898,9 +902,9 @@ def on_player_made_advancement(server, player, advancement):
     if not translated_advancement:
         warn('Failed to translate the advancement name. Use origin name instead.')
     msg = Message.from_server_console_echo(
-        '{player_id} 达成成就 {advancement}'.format(player_id=player,
-                                                advancement=translated_advancement if translated_advancement else advancement),
-        '喜訊')
+        '{player_id}达成成就{advancement}'.format(player_id=player,
+                                              advancement=translated_advancement if translated_advancement else advancement),
+        HEAD_PLAYER_ADVANCEMENT)
     if isinstance(sender_thread, MessageSenderThread):
         # If the message sender thread is alive.
         sender_thread.push(msg)
