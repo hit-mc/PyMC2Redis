@@ -1,7 +1,7 @@
 # -------------------------------------------------
 # PyMC2Redis: Python Minecraft to Redis script
 # Author: Keuin
-# Version: 1.35 2020.08.22
+# Version: 1.36 2020.08.30
 # Homepage: https://github.com/keuin/pymc2redis
 # -------------------------------------------------
 
@@ -17,7 +17,7 @@ import redis
 from redis import Redis
 
 CONFIG_FILE_NAME = 'pymc2redis.json'
-VERSION = '1.35 2020.08.22'
+VERSION = '1.36 2020.08.30'
 
 MESSAGE_THREAD_RECEIVE_TIMEOUT_SECONDS = 2  # timeout in redis LPOP operation
 MESSAGE_THREAD_SLEEP_SECONDS = 0.5  # time in threading.Event.wait()
@@ -32,6 +32,7 @@ MSG_ENCODING = 'utf-8'
 MSG_COLOR = '§7'
 MSG_USER_COLOR = '§d'
 MSG_SPLIT_STR = '||'
+MSG_AT_TEMPLATE = '[@{qq_number}]'
 
 HEAD_PLAYER_LIST = 'SERVER'
 HEAD_PLAYER_DIE = '悲報'
@@ -59,6 +60,7 @@ CFG_LANGUAGE = 'lang'
 CFG_TRANSLATION_SETTING = 'translating'
 CFG_TRANSLATION_FROM = 'from'
 CFG_TRANSLATION_TO = 'to'
+CFG_ID_MAPPING = 'id_mapping'
 
 
 # Simple logger wrapper
@@ -165,6 +167,45 @@ def translate(lang_from: dict, lang_to: dict, text: str):
         s = s.replace(pattern, real)
 
     return s
+
+
+# Simple edit distance calculator for alias hint
+
+def __edit_distance_dp(str1, str2, m, n):
+    # Create a table to store results of sub-problems
+    dp = [[0 for x in range(n + 1)] for x in range(m + 1)]
+
+    # Fill d[][] in bottom up manner
+    for i in range(m + 1):
+        for j in range(n + 1):
+
+            # If first string is empty, only option is to
+            # insert all characters of second string
+            if i == 0:
+                dp[i][j] = j  # Min. operations = j
+
+            # If second string is empty, only option is to
+            # remove all characters of second string
+            elif j == 0:
+                dp[i][j] = i  # Min. operations = i
+
+            # If last characters are same, ignore last char
+            # and recur for remaining string
+            elif str1[i - 1] == str2[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1]
+
+                # If last character are different, consider all
+            # possibilities and find minimum
+            else:
+                dp[i][j] = 1 + min(dp[i][j - 1],  # Insert
+                                   dp[i - 1][j],  # Remove
+                                   dp[i - 1][j - 1])  # Replace
+
+    return dp[m][n]
+
+
+def edit_distance(a: str, b: str):
+    return __edit_distance_dp(a, b, len(a), len(b))
 
 
 # Redis command related
@@ -332,16 +373,23 @@ class Message:
         return None
 
     @staticmethod
-    def from_ingame_chat(raw_chat_str_with_prefix: str, sender: str):
+    def from_ingame_chat(raw_chat_str_with_prefix: str, sender: str, id_mapping_inv_index=None):
         """
         Build a Message object with in-game chat string and sender ID.
         :param raw_chat_str_with_prefix: the chat string. such as '#Hello!'
         :param sender: the sender.
-        :return: A Message. If the parameter is invalid, return None.
+        :return: A Message and an index list of invalid ats. If the parameter is invalid, return None.
         """
         if not Message.is_outbound_message(raw_chat_str_with_prefix):
             return None
-        return Message(sender, Message.__clean_message(raw_chat_str_with_prefix))
+        msg_cleaned = Message.__clean_message(raw_chat_str_with_prefix)
+        if not id_mapping_inv_index:
+            # If id mapping is not defined
+            return msg_cleaned
+
+        msg_alias_processed, invalid_list = Message.__convert_at_ids_to_qq_numbers(msg_cleaned, id_mapping_inv_index)
+
+        return Message(sender, msg_alias_processed), invalid_list
 
     @staticmethod
     def from_server_console_echo(echo: str, title='SERVER'):
@@ -379,6 +427,35 @@ class Message:
             if message.startswith(pf):
                 return message[len(pf):]
         return message
+
+    @staticmethod
+    def __convert_at_ids_to_qq_numbers(msg: str, id_mapping: dict) -> (str, list):
+        """
+        Convert valid ats to qq numbers. Return invalid ats.
+        :param msg: the message.
+        :param id_mapping: the mapping.
+        :return: message and a index list of invalid ats. The indexes is referencing the original message string.
+        """
+        # Buggy: aliases must not share a common prefix.
+        replace_list = []
+        invalid_list = []
+        for i in range(len(msg)):
+            if msg[i] == '@':
+                valid = False
+                for alias, qq_number in id_mapping.items():
+                    if msg[i + 1:].lower().startswith(alias.lower()):
+                        # a valid match
+                        replace_list.append((msg[i + 1:i + 1 + len(alias)], qq_number))
+                        valid = True
+                        break
+                if not valid:
+                    # the at is invalid
+                    invalid_list.append(i)
+
+        for src, dst in replace_list:
+            msg = msg.replace('@' + src, MSG_AT_TEMPLATE.format(qq_number=dst), 1)
+
+        return msg, invalid_list
 
     def __to_ingame_string(self, msg_color=MSG_COLOR, user_color=MSG_USER_COLOR) -> str:
         return '{user_color}<{user}> {msg_color}{msg}'.format(
@@ -492,6 +569,7 @@ counter_message_to_game = 0
 counter_message_to_redis = 0
 counter_send_failure = 0
 rcommand = None  # A RCommand waiting for response.
+id_mapping_inv_index = dict()
 
 
 def redis_connect() -> bool:
@@ -615,7 +693,8 @@ def init() -> bool:
     :return: True if success, False if failed to initialize.
     """
     global con, enabled, config_server, config_keys, language, translating, receiver_thread, sender_thread
-    global redis_reconnect_lock, retry_counter, counter_message_to_game, counter_message_to_redis, counter_send_failure, rcommand
+    global redis_reconnect_lock, retry_counter, counter_message_to_game, counter_message_to_redis, counter_send_failure
+    global rcommand, id_mapping_inv_index
 
     # reset connection
     if con:
@@ -692,6 +771,31 @@ def init() -> bool:
     if translating['to'] not in language:
         error('The language {} of translating.to is not defined.'.format(translating['to']))
         return False
+
+    # Load id mappings and create inverted index
+
+    id_mapping = config.get(CFG_ID_MAPPING)
+
+    if isinstance(id_mapping, dict):
+        # valid mapping config
+        info('Loading inverted id-mapping index...')
+
+        inv_index = dict()
+        alias_counter = 0
+        for k, v in id_mapping.items():
+            # k: qq, v: alias list
+            if isinstance(v, list):
+                for alias in v:
+                    # alias -> qq
+                    inv_index[alias] = k
+                    alias_counter += 1
+            else:
+                warn('Invalid value type of {} in {}: must be a list.'.format(k, CFG_ID_MAPPING))
+        id_mapping_inv_index = inv_index
+        info('Loaded {} alias(es).'.format(alias_counter))
+    else:
+        info('ID mapping is not defined. Skip.')
+        id_mapping_inv_index = dict()
 
     # --- check config ---
 
@@ -789,10 +893,35 @@ def on_user_info(server, info_):
     if Message.is_outbound_message(msg):
         # If the message sent by a player is a valid outbound message (to Redis).
         # Message
-        message = Message.from_ingame_chat(msg, player)
+        message, invalid_ats = Message.from_ingame_chat(msg, player, id_mapping_inv_index)
         if isinstance(sender_thread, MessageSenderThread):
             # If the message sender thread is alive.
             sender_thread.push(message)
+
+            # ---- Show hints of invalid ats ----
+
+            # this is a list
+            min_distance_of_invalid_ats = []
+            sorted_alias_lists = []
+            for i in invalid_ats:
+                t = len(msg) - i
+                # we use msg[i+j:] to traverse all prefix sub strings
+                sorted_alias_lists.append(
+                    sorted(
+                        list(id_mapping_inv_index.keys()),
+                        key=lambda alias: min([
+                            edit_distance(msg[i + j:], alias) for j in range(t)
+                        ])
+                    )
+                )
+
+            for sorted_alias_list in sorted_alias_lists:
+                hints = sorted_alias_list[:4]
+                server.reply(info_,
+                             'You are mentioning an invalid player id. Do you mean {} ?'.format(str(hints)[1:-1]))
+
+            # --------
+
         else:
             error('Message sender thread is not alive. Cannot repeat outbound message.')
     elif msg.upper() == COMMAND_RESET.upper():
