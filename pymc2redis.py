@@ -31,8 +31,9 @@ MSG_PREFIX = [' ', '#']
 MSG_ENCODING = 'utf-8'
 MSG_COLOR = '§7'
 MSG_USER_COLOR = '§d'
+MSG_MENTION_COLOR = '§b'
 MSG_SPLIT_STR = '||'
-MSG_AT_TEMPLATE = '[@{qq_number}]'
+MSG_AT_TEMPLATE = '\n@{qq_number}\n'
 
 HEAD_PLAYER_LIST = 'SERVER'
 HEAD_PLAYER_DIE = '悲報'
@@ -123,7 +124,7 @@ def translate_format_item_value(a: str):
 
 def translate(lang_from: dict, lang_to: dict, text: str):
     """
-    Trnaslate a in-game message to a specific language.
+    Translate a in-game message to a specific language.
     :param lang_from: the origin language.
     :param lang_to: the desired language.
     :param text: the message text to be translated.
@@ -265,7 +266,7 @@ class RCList(RCommand):
     """
 
     def is_valid_echo(self, message: str) -> bool:
-        if re.match(r'There are [0-9]+ of a max [0-9]+ players online:', message):
+        if re.match(r'There are [0-9]+ of a max [0-9]+ players online:', message) or message == 'No player was found':
             self._reply = message
             return True
         return False
@@ -273,7 +274,10 @@ class RCList(RCommand):
     def _format_reply(self, reply: str) -> str:
         r = re.findall(r'There are [0-9]+ of a max [0-9]+ players online:.*', reply)
         if not r:
-            return 'Error: blank reply message.'
+            if reply == 'No player was found':
+                return 'No players online.'
+            else:
+                return 'Error: blank reply message.'
         return r[0]
 
     def execute(self, server):
@@ -315,9 +319,12 @@ class MessageReceiverThread(Thread):
                 if not msg:
                     warn('Cannot parse message: {}'.format(raw_message))
                     continue
+                log('Received message from Redis server. Sender={sender}, Message={msg}.'.format(
+                    sender=msg.get_sender(), msg=msg.get_body()))
                 rcmd_instance = RCommand.from_redis_message(msg.get_body())
                 if rcmd_instance:
                     # If the message is a valid Redis command
+                    log('A valid RCommand instance was created from instruction {}'.format(msg.get_body()))
                     if not rcommand:
                         rcommand = rcmd_instance
                         rcmd_instance.execute(svr)
@@ -327,7 +334,7 @@ class MessageReceiverThread(Thread):
                                 msg.get_body()))
                 else:
                     # The message is a normal chat msg. Just repeat it.
-                    msg.print_ingame_message()
+                    msg.display()
 
                 # finish processing Redis message
                 # update counters
@@ -343,19 +350,59 @@ class MessageReceiverThread(Thread):
         info('MRT enabled={e}, con={c}'.format(e=enabled, c=con))
 
 
+def get_game_id_from_qq(qq: str):
+    """
+    Translate QQ to Game ID.
+    :param qq: the QQ number.
+    :return: game ID. None if failed.
+    """
+    global config_id_mapping
+    id_mapping = config_id_mapping
+    if not isinstance(id_mapping, dict):
+        return None
+    alias_list = id_mapping.get(qq)
+    if not isinstance(alias_list, list):
+        return None
+    if len(alias_list) > 0:
+        return alias_list[0]
+    return None
+
+
 class Message:
     __sender = ""
     __body = ""
+    __mentioned_players = []  # Game ID
 
     def __init__(self, sender: str, body: str):
+        mentioned_players_raw = re.findall(r'\[@[0-9]+\]', body)
+        mentioned_players_qq = [s[2:-1] for s in mentioned_players_raw]
         self.__sender = sender
+
+        for r in zip(mentioned_players_raw, mentioned_players_qq):
+            body = body.replace(r[0], '{mention_color}@{id}{msg_color}'.format(id=get_game_id_from_qq(r[1]),
+                                                                               mention_color=MSG_MENTION_COLOR,
+                                                                               msg_color=MSG_COLOR))
         self.__body = body
+
+        players = []
+        for qq in mentioned_players_qq:
+            game_id = get_game_id_from_qq(qq)
+            if game_id:
+                players.append(game_id)
+        self.__mentioned_players = players
 
     def get_sender(self):
         return self.__sender
 
     def get_body(self):
         return self.__body
+
+    def get_mentioned_players(self):
+        """
+        Get IDs of mentioned players in this message.
+        :return: a game ID list.
+        """
+        return list(self.__mentioned_players)
 
     @staticmethod
     def from_redis_raw_bytes(raw_bytes: bytes, encoding: str = MSG_ENCODING):
@@ -366,10 +413,13 @@ class Message:
         :return: the Message object. If failed, return None.
         """
         str_ = str(raw_bytes, encoding=encoding)
-        r = re.match(r'([^|]*)(?:\|\|)(.*)', str_)
+        log('Raw message string: {}'.format(str_))
+        r = re.match(r'([^|]*)(?:\|\|)([\s\S]*)', str_)
         if r and len(r.groups()) == 2:
             g = r.groups()
-            return Message(g[0], g[1])
+            sender = g[0]
+            body = g[1]
+            return Message(sender, body)
         return None
 
     @staticmethod
@@ -414,12 +464,23 @@ class Message:
         """
         return "{sender}{split}{msg}".format(sender=self.__sender, msg=self.__body, split=MSG_SPLIT_STR)
 
-    def print_ingame_message(self):
+    def display(self):
         """
         Print this message on the in-game chat menu, with the default format.
         """
         if svr:
             svr.say(self.__to_ingame_string())
+            # mentioned_players = self.get_mentioned_players()
+            # for player_id in mentioned_players:
+            #     log('Notifying player {}...'.format(player_id))
+            #     for _ in range(3):
+            #         svr.execute('playsound minecraft:block.note_block.bell master {game_id}'.format(game_id=player_id))
+            #         time.sleep(0.25)
+            # if not mentioned_players:
+            #     log('No player is mentioned.')
+        else:
+            error('Server instance "svr" is not available. Cannot display in-game message: {}:{}'.format(
+                self.get_sender(), self.get_body()))
 
     @staticmethod
     def __clean_message(message: str) -> str:
@@ -558,6 +619,7 @@ con = None
 enabled = False
 config_server = dict()
 config_keys = dict()
+config_id_mapping = dict()
 language = {}
 translating = {"from": "", "to": ""}
 svr = None
@@ -694,7 +756,7 @@ def init() -> bool:
     """
     global con, enabled, config_server, config_keys, language, translating, receiver_thread, sender_thread
     global redis_reconnect_lock, retry_counter, counter_message_to_game, counter_message_to_redis, counter_send_failure
-    global rcommand, id_mapping_inv_index
+    global rcommand, id_mapping_inv_index, config_id_mapping
 
     # reset connection
     if con:
@@ -775,14 +837,17 @@ def init() -> bool:
     # Load id mappings and create inverted index
 
     id_mapping = config.get(CFG_ID_MAPPING)
+    if not id_mapping:
+        id_mapping = dict()
+    config_id_mapping = id_mapping
 
-    if isinstance(id_mapping, dict):
+    if isinstance(config_id_mapping, dict):
         # valid mapping config
         info('Loading inverted id-mapping index...')
 
         inv_index = dict()
         alias_counter = 0
-        for k, v in id_mapping.items():
+        for k, v in config_id_mapping.items():
             # k: qq, v: alias list
             if isinstance(v, list):
                 for alias in v:
@@ -1031,8 +1096,10 @@ def on_player_made_advancement(server, player, advancement):
     if not translated_advancement:
         warn('Failed to translate the advancement name. Use origin name instead.')
     msg = Message.from_server_console_echo(
-        '{player_id}达成成就{advancement}'.format(player_id=player,
-                                              advancement=translated_advancement if translated_advancement else advancement),
+        '{player_id}达成成就{advancement}'.format(
+            player_id=player,
+            advancement=translated_advancement if translated_advancement else advancement
+        ),
         HEAD_PLAYER_ADVANCEMENT)
     if isinstance(sender_thread, MessageSenderThread):
         # If the message sender thread is alive.
