@@ -1,7 +1,7 @@
 # -------------------------------------------------
 # PyMC2Redis: Python Minecraft to Redis script
 # Author: Keuin
-# Version: 1.36 2020.08.30
+# Version: 1.37 2020.09.03
 # Homepage: https://github.com/keuin/pymc2redis
 # -------------------------------------------------
 
@@ -17,7 +17,7 @@ import redis
 from redis import Redis
 
 CONFIG_FILE_NAME = 'pymc2redis.json'
-VERSION = '1.36 2020.08.30'
+VERSION = '1.37 2020.09.03'
 
 MESSAGE_THREAD_RECEIVE_TIMEOUT_SECONDS = 2  # timeout in redis LPOP operation
 MESSAGE_THREAD_SLEEP_SECONDS = 0.5  # time in threading.Event.wait()
